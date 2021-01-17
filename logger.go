@@ -2,6 +2,7 @@ package log15
 
 import (
 	"fmt"
+	"runtime"
 	"strings"
 	"time"
 
@@ -101,20 +102,84 @@ type Logger interface {
 	Warn(msg string, ctx ...interface{})
 	Error(msg string, ctx ...interface{})
 	Crit(msg string, ctx ...interface{})
+
+	SetTrimedPKG(...string)
 }
 
 type logger struct {
-	ctx []interface{}
-	h   *swapHandler
+	ctx       []interface{}
+	h         *swapHandler
+	trimedPKG []string
+}
+
+func pkgFilePath(frame *runtime.Frame) string {
+	pre := pkgPrefix(frame.Function)
+	post := pathSuffix(frame.File)
+	if pre == "" {
+		return post
+	}
+	return pre + "/" + post
+}
+
+// pkgPrefix returns the import path of the function's package with the final
+// segment removed.
+func pkgPrefix(funcName string) string {
+	const pathSep = "/"
+	end := strings.LastIndex(funcName, pathSep)
+	if end == -1 {
+		return ""
+	}
+	return funcName[:end]
+}
+
+// pathSuffix returns the last two segments of path.
+func pathSuffix(path string) string {
+	const pathSep = "/"
+	lastSep := strings.LastIndex(path, pathSep)
+	if lastSep == -1 {
+		return path
+	}
+	return path[strings.LastIndex(path[:lastSep], pathSep)+1:]
 }
 
 func (l *logger) write(msg string, lvl Lvl, ctx []interface{}) {
+	var (
+		call stack.Call
+		ok   bool
+	)
+	if len(l.trimedPKG) > 0 {
+		found := false
+	foo:
+		for _, frame := range stack.Trace().TrimRuntime() {
+			f := frame.Frame()
+			path := pkgFilePath(&f)
+			for _, pkg := range l.trimedPKG {
+				if strings.HasPrefix(path, pkg) {
+					found = true
+					continue foo
+				}
+				if !found {
+					continue foo
+				}
+			}
+
+			if found {
+				call = frame
+				ok = true
+				break
+			}
+		}
+	}
+	if !ok {
+		call = stack.Caller(2)
+	}
+
 	l.h.Log(&Record{
 		Time: time.Now(),
 		Lvl:  lvl,
 		Msg:  msg,
 		Ctx:  newContext(l.ctx, ctx),
-		Call: stack.Caller(2),
+		Call: call,
 		KeyNames: RecordKeyNames{
 			Time: timeKey,
 			Msg:  msgKey,
@@ -124,7 +189,7 @@ func (l *logger) write(msg string, lvl Lvl, ctx []interface{}) {
 }
 
 func (l *logger) New(ctx ...interface{}) Logger {
-	child := &logger{newContext(l.ctx, ctx), new(swapHandler)}
+	child := &logger{newContext(l.ctx, ctx), new(swapHandler), nil}
 	child.SetHandler(l.h)
 	return child
 }
@@ -163,6 +228,10 @@ func (l *logger) GetHandler() Handler {
 
 func (l *logger) SetHandler(h Handler) {
 	l.h.Swap(h)
+}
+
+func (l *logger) SetTrimedPKG(s ...string) {
+	l.trimedPKG = s
 }
 
 func normalize(ctx []interface{}) []interface{} {
